@@ -1,0 +1,413 @@
+#!/usr/bin/env python
+#
+# pypxeboot - simple python-based bootloader to fake PXE booting for Xen DomUs
+# Uses a modified version of udhcpc that allows MAC address to be passed on
+# the command line. Also uses tftp client to download configuration and images
+#
+# Copyright 2007 Trinity College Dublin
+# Stephen Childs <childss@cs.tcd.ie>
+#
+# Modifications by Aethernet Ltd., 01-2010
+# Magnus Leuthner, magnus.leuthner@aethernet.co.uk
+#
+# This software may be freely redistributed under the terms of the GNU
+# general public license.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+#
+
+import commands, sys, re, os, getopt, tempfile, shutil, tftpy
+
+# absolute/relative path to udhcpc binary
+UDHCPC_OPTIONS  = "-n -q"
+# script to pass to udhcpc, this formats the DHCP output according to what
+# our parser expects
+UDHCPC_SCRIPT   = "/usr/share/udhcpc/outputpy.udhcp.sh"
+# temporary directory to use
+TMPDIR          = "/tmp"
+# directory to put the downloaded kernel image and initrd into
+IMAGE_OUTPUT_DIR= "/var/lib/xen"
+# default TFTP port
+TFTP_PORT = 69
+# paths to external pygrub
+PYGRUB_COMMAND = "pygrub"
+
+# The hardware type to preprend to the MAC address when looking for
+# boot config file on TFTP server. FIXME: determine this dynamically!
+HW_TYPE = "01"
+
+# sub-dir of the config files on the tftp server
+config_dir = "pxelinux.cfg"
+
+# regular expressions used to match the configuration lines
+r_label     = re.compile(r"^[ \t]*label (.+)$", re.IGNORECASE)
+r_kernel    = re.compile(r"^[ \t]*kernel (.+)$", re.IGNORECASE)
+r_append    = re.compile(r"^[ \t]*append (.+)$", re.IGNORECASE)
+r_default   = re.compile(r"^[ \t]*default (.+)$", re.IGNORECASE)
+r_localboot = re.compile(r"^[ \t]*localboot (.*)$", re.IGNORECASE)
+r_mac_address = re.compile(r"^([\da-f]{2}:){5}[\da-f]{2}$", re.IGNORECASE)
+
+# these hold command line configuration 
+output = None
+selected_label = None
+mac = None
+interface = None
+# default dir to look in for udhcpc
+udhcpc_command = "udhcpc" 
+quiet = True
+pygrub_image = None
+
+# log function for any output that can be suppressed with -q
+def log(s):
+    if not quiet:
+        print(s)
+
+# returns true if the command can be executed as-is
+def check_runnable(cmd):
+    if cmd[0] == '/':
+        return os.path.exists(cmd)
+    else:
+        # search the path
+        for path_entry in os.environ['PATH'].split(':'):
+            if os.path.exists( path_entry + '/' + cmd ):
+                return True
+        return False
+
+def run_command(cmd):
+    log("pypxeboot: Running: %s" % (cmd))
+    return commands.getstatusoutput(cmd)
+
+class FileNotFound(Exception):
+    pass
+
+# fetch a file from the given server using TFTP
+# throws a FileNotFound error if file is missing
+def tftp_get_file( host, port, remote_file, local_file ):
+    log('pypxeboot: Transferring tftp://%s:%i/%s -> %s' % (host, port, remote_file, local_file))
+    client = tftpy.TftpClient( host, port )
+    try:
+        client.download( remote_file, local_file )
+        if not os.path.exists( local_file ):
+            raise FileNotFound
+            #raise SystemExit("pypxeboot: Could not retrieve TFTP file: %s:%i/%s" % ( host, port, remote_file ))
+    except:
+        # FIXME: it is naive to assume that any error that happens during the transfer is a
+        # "file not found" exception, but since TFTPy doesn't really tell us much as to what
+        # actually went wrong, we'll have to assume it's not a permission issue or such
+        raise FileNotFound
+        # FIXME end
+
+def usage():
+    sys.stderr.write( \
+    """Usage: %s [-v|--verbose] [--config-dir=<DIRECTORY>] [--output=<FILENAME>] [--label=<LABEL>] [--interface=<INTERFACE-NAME>] [--udhcpc=<PATH>] [--pygrub-image=<IMAGE>] mac=<MAC-ADDRESS>
+
+    -v, --verbose:      Print verbose messages for debugging 
+                        (for debugging)
+
+    --config-dir=DIR:   Set the configuration directory to look for on the
+                        tftp server (defaults to 'pxeboot.cfg')
+
+    --output=FILE:      Direct output to this file. Use '-' for stdout (default).
+
+    --label=LABEL:      Boot this boot record from the boot configuration
+                        (defaults to using the default boot label found in the
+                        configuration)
+
+    --interface=IFDESC: Use this interface to send DHCP requests
+
+    --udhcpc=PATH:      Path to the udhcpc executable. Default: /usr/bin/udhcpc
+
+    --pygrub-image=IMG: Boot this pygrub image if the 'localboot' directive is
+                        encountered in the boot configuration (usually the
+                        root partition of the virtual machine)
+
+""" % (sys.argv[0],))
+
+# get arguments from calling program -- most important is MAC address
+try:
+    opts, args = getopt.gnu_getopt(sys.argv[1:], 'vqh::',
+                                   ["verbose", 
+                                    "help", 
+                                    "output=", 
+                                    "label=", 
+                                    "interface=", 
+                                    "udhcpc=", 
+                                    "pygrub-image=", 
+                                    "isconfig"])
+except getopt.GetoptError:
+    usage()
+    sys.exit(1)
+
+if len(args) < 1:
+    usage()
+    sys.exit(1)
+
+# read command line options
+for o, a in opts:
+    if o in  ("--output",):
+        output = a
+    elif o in  ("--label",):
+        selected_label = a
+    elif o in  ("--interface",):
+        interface = a
+    elif o in  ("--udhcpc",):
+        udhcpc_command = a
+    elif o in  ("--verbose","-v"):
+        quiet = False
+    elif o in  ("--pygrub-image",):
+        pygrub_image = a
+    elif o in  ("--config-dir",):
+        config_dir = a
+
+# read MAC address parameter
+for arg in sys.argv[1:]:
+    if arg.startswith('mac='):
+        # since the 'vif' xendomain-configuration might
+        # contrain a trailing ',' strip that
+        mac = arg.split('=')[1].strip(',')
+
+# verify MAC address
+if not mac:
+    print("pypxeboot: Error: Please specify a MAC address")
+    usage()
+    sys.exit(1)
+elif not r_mac_address.match(mac): 
+    print("pypxeboot: Error: Invalid MAC address: %s" % mac)
+    usage()
+    sys.exit(1)
+else:
+    log("pypxeboot: Requesting info for MAC address %s" % mac)
+
+# verify sanity of command line options
+if output is None or output == "-":
+    outputfd = sys.stdout.fileno()
+else:
+    outputfd = os.open(output, os.O_WRONLY)
+
+if selected_label is not None and len(selected_label) < 1:
+    print("pypxeboot: Error: Please specify a valid kernel boot label")
+    usage()
+    sys.exit(1)
+
+# make sure scripts exist
+if not check_runnable(udhcpc_command):
+    print("pypxeboot: Error: Cannot execute udhcpc command: %s" % udhcpc_command)
+    sys.exit(1)
+
+if not os.path.exists(UDHCPC_SCRIPT):
+    print("pypxeboot: Error: Missing udhcpc script, expected at: %s" % UDHCPC_SCRIPT)
+    usage()
+    sys.exit(1)
+
+# build the UDHCPC options
+options = UDHCPC_OPTIONS
+if interface:
+    options += " -i %s" % interface
+options += " -M %s -s %s" % (mac, UDHCPC_SCRIPT)
+
+# run modified udhcp with specified MAC address
+command = '%s %s' % (udhcpc_command, options)
+udhcp_result = run_command(command)
+
+if (udhcp_result[0] != 0):
+    if udhcp_result[1].find('No lease') != -1:
+        print("pypxeboot: Error: udhcpc could not get a lease (%s). Did you specify the appropriate network interface using the --interface switch?")
+    elif udhcp_result[1].find('invalid parameter'):
+        print("pypxeboot: Error: udhcpc did not recognize the -M parameter (%s). pypxeboot requires a patched version of udhcpc.")
+    else:
+        print("pypxeboot: Error: udhcpc failed (%s), output: %s\n" %(udhcp_result[0], udhcp_result[1]))
+    sys.exit(1)
+
+# parse output from udhcp-executed script (looking for key=value pairs)
+dhcpinfo={}
+
+for line in udhcp_result[1].split('\n'):
+    s = line.strip()
+    if ( s.find('=') > 0 ):
+        f = s.split('=')
+        dhcpinfo[f[0]]=f[1]
+
+# run tftp client to get configuration info, check response
+if not 'siaddr' in dhcpinfo:
+    print('pypxeboot: Error: Missing next-server (siaddr) in udhcpc response:\n%s' % udhcp_result[1])
+    sys.exit(1)
+elif not 'ip' in dhcpinfo:
+    print('pypxeboot: Error: Missing IP address in udhcpc response:\n%s' % udhcp_result[1])
+    sys.exit(1)
+servaddr = dhcpinfo['siaddr']
+ipaddr = dhcpinfo['ip']
+
+# log received data
+log("pypxeboot: Received IP address %s, next server is %s" % (ipaddr, servaddr))
+
+# get the boot configuration file
+log("pypxeboot: Getting boot config for IP %s from server %s" %(ipaddr,servaddr))
+os.chdir(TMPDIR)
+
+# first file to look for: mac address
+dash_mac = '%s-%s' % (HW_TYPE, mac.replace(':', '-'))
+# second file to look for: hex representation of dhcp IP address
+hexip = (4 * "%2.2X") % tuple(map ( int, ipaddr.split('.') ))
+# third file to look for: default fallback file
+default = 'default'
+
+# look for the config files in sequence, the first existing file 
+# is being used, the others are ignored
+for filename in (dash_mac, hexip, default):
+    cfgfilename = "%s/%s" % (TMPDIR, filename)
+    try:
+        tftp_get_file( servaddr, TFTP_PORT, "%s/%s" % (config_dir, filename), cfgfilename )
+    except FileNotFound:
+        continue # Neeext!
+    else:
+        # found a file, break out of the file search loop
+        log('pypxeboot: Using boot config file: tftp://%s:%i/%s/%s' % (servaddr, TFTP_PORT, config_dir, filename))
+        break # Done!
+else:
+    print('pypxeboot: Error: Could not find a valid boot configuration file on the tftp server (%s)' % servaddr)
+    sys.exit(1)
+
+# read in the downloaded pxelinux cfg file and delete the temporary file
+cfgfile = open(cfgfilename, 'r')
+cfglines = cfgfile.readlines()
+cfgfile.close()
+os.remove(cfgfilename)
+
+# if "network" boot get kernel to local file and return the location as
+# sxp as pygrub does
+
+syslinux = {}
+current_label = None
+default_label = None
+
+log('pypxeboot: Parsing boot config %s' % cfgfilename )
+for line in cfglines:
+    line = line.strip()
+    if( len(line) and line[0] != '#' ): # ignore comments
+
+        if r_default.match(line):
+            default_label = r_default.match(line).group(1)
+            log('pypxeboot: Default label: %s' % default_label )
+
+        elif r_label.match(line):
+            current_label = r_label.match(line).group(1)
+            log("pypxeboot: Found label: %s" % current_label)
+            syslinux[current_label] = {}
+            syslinux[current_label]['append'] = None
+
+        elif r_kernel.match(line):
+            assert current_label is not None, "Input file malformed: kernel outside label"
+            kernel = r_kernel.match(line).group(1)
+            syslinux[current_label]['kernel'] = kernel
+
+        elif r_append.match(line):
+            assert current_label is not None, "Input file malformed: append outside label"
+            append = r_append.match(line).group(1)
+            syslinux[current_label]['append'] = {}
+            for entry in append.split():
+                if (entry.find('=') != -1):
+                    (k,v) = entry.split('=')
+                    syslinux[current_label]['append'][k] = v
+                else:
+                    syslinux[current_label]['append'][k] = None
+
+        elif r_localboot.match(line):
+            syslinux[current_label]['localboot'] = r_localboot.match(line).group(1)
+log("pypxeboot: Done parsing the boot config file, found %i labels: %s" % (len(syslinux.keys()), ', '.join(syslinux.keys())))
+
+if selected_label is None:
+    if default_label is None:
+        print('pypxeboot: Error: No default label in boot config and no label specified, please use the --label switch to specify a label to boot. The config file contains these labels: %s' % ', '.join(syslinux.keys()))
+        sys.exit(1)
+    else:
+        selected_label = default_label
+
+if selected_label not in syslinux:
+    print('pypxeboot: Error: The specified label "%s" was not found in the boot config. Please use the --label switch to specify a label to boot. The config file contains these labels: %s' % (selected_label, ', '.join(syslinux.keys())))
+    sys.exit(1)
+
+# boot locally?
+if 'localboot' in syslinux[selected_label]:
+    log('pxelinux: Label "%s" specifies localboot option, dropping to pygrub' % selected_label)
+
+    if not pygrub_image:
+        print('pypxeboot: Cannot run pygrub, no root image specified. Please use the --pygrub-image parameter.')
+        sys.exit(1)
+
+    if not check_runnable(PYGRUB_COMMAND):
+        print("pypxeboot: Error: Cannot execute pygrub command: %s" % PYGRUB_COMMAND)
+        sys.exit(1)
+
+    # append the pygrub image to the parameter list (if specified)
+    if quiet:
+        arglist = [PYGRUB_COMMAND, '-q', pygrub_image]
+    else:
+        arglist = [PYGRUB_COMMAND, pygrub_image]
+
+    log("pypxeboot: Running pygrub using command: %s" % ' '.join(arglist))
+    #os.execvp(PYGRUB_COMMAND, arglist)
+    sxp = os.popen(' '.join(arglist)).read()
+    sys.stdout.flush()
+    os.write(outputfd, sxp)
+    os.close(outputfd)
+    sys.exit(0)
+
+# if network boot, get kernel and initrd
+# temp directory should still be the working dir
+
+# retrieve initrd
+if 'initrd' in syslinux[selected_label]['append']:
+    abs_filename = syslinux[selected_label]['append']['initrd']
+    filename = abs_filename.split('/')[-1]
+    initrd_file = "%s/%s" % (IMAGE_OUTPUT_DIR, filename)
+    try:
+        tftp_get_file( servaddr, TFTP_PORT, abs_filename, initrd_file )
+    except FileNotFound: 
+        print("pypxeboot: Could not retrieve initrd file from TFTP server (%s)" % abs_filename)
+        sys.exit(1)
+else:
+    log('pypxeboot: No initrd in kernel parameters')
+
+# retrieve kernel image
+abs_filename = syslinux[selected_label]['kernel']
+filename = abs_filename.split('/')[-1]
+kernel_file = "%s/%s" % (IMAGE_OUTPUT_DIR, filename)
+try:
+    tftp_get_file( servaddr, TFTP_PORT, abs_filename, kernel_file)
+except FileNotFound:
+    print("pypxeboot: Could not retrieve initrd file from TFTP server (%s)" % abs_filename)
+    sys.exit(1)
+
+# format kernel and args as sxp
+# will need to get the --output option and write to that fd
+kernelname = syslinux[selected_label]['kernel'].split('/')[-1]
+if 'initrd' in syslinux[selected_label]:
+    initrdname = syslinux[selected_label]['initrd'].split('/')[-1]
+else:
+    initrdname = None
+
+sxp="linux (kernel %s)" % kernel_file
+
+if 'initrd' in syslinux[selected_label]['append']: # got initrd for this kernel?
+    sxp += "(ramdisk %s)" % initrd_file
+
+if syslinux[selected_label]['append']: # got kernel parameters for this kernel?
+    sxp+="(args '"
+    for key,value in syslinux[selected_label]['append'].iteritems():
+        if key not in ('kernel', 'initrd'):
+            sxp += key
+            if value:
+                sxp += "=" + value
+            sxp += ' '
+    sxp = sxp[0:-1] # remove trailing space
+    sxp += "'"
+sxp += ")"
+
+# and flush, always flush!
+sys.stdout.flush()
+os.write(outputfd, sxp)
+os.close(outputfd)
+sys.exit(0)
+

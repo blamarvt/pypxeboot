@@ -1,0 +1,70 @@
+pypxeboot
+
+pypxeboot is a bootloader for Xen guests that simulates a PXE client. pypxeboot
+runs on the Domain 0 as part of the creation of a new domain, and requests an
+IP address and configuration information on behalf of the as-yet uncreated guest
+(DomU). pypxeboot uses a modified version of udhcp [1] that allows a MAC address
+to be specified on the command line. A patch against verion 0.9.8 of udhcp is
+included in the tarball. From version 0.0.3, you will also need tftpy installed (package "python-tftpy" in Fedora, Debian, Ubuntu) [2]
+
+Download
+A tarball including pypxeboot, the patch for udhcp and the script for udhcp to
+output information retrieved from the DHCP server is available here: 
+pypxeboot-0.0.3.tar.gz. [3]
+
+Installation
+
+   1. Download udhcp [1], patch it, build it and install it. Download and
+      install tftp. Download pypxeboot.
+   2. Copy pypxeboot to /usr/bin and outputpy.udhcp.sh to /usr/share/udhcpc
+   3. Add the following lines to the Xen configuration file for the domain:
+
+      bootloader="/usr/bin/pypxeboot"
+      vif=['mac=AA:00:86:e2:35:72']
+      bootargs=vif[0]
+
+Now when you do
+
+xm create "domain-name"
+
+you should see output like this if the pxelinux.cfg entry is set to localboot:
+
+[root@tg23 pypxeboot]# xm create  cagnode50-slc308
+Using config file "/etc/xen/cagnode50-slc308".
+pypxeboot: requesting info for MAC address AA:00:86:e2:35:72
+pypxeboot: getting cfg for IP 134.226.53.114 (86E23572) from server 192.168.12.1
+pypxeboot: dropping to pygrub for local boot
+Going to boot Scientific Linux CERN Xen DomU-xenU (2.4.21-47.0.1.EL.cernxenU)
+  kernel: /vmlinuz-2.4.21-47.0.1.EL.cernxenU
+  initrd: /initrd-2.4.21-47.0.1.EL.cernxenU.img
+
+and something like this if the pxelinux.cfg entry specifies a network boot:
+
+[root@tg23 pypxeboot]# xm create  cagnode50-slc308
+Using config file "/etc/xen/cagnode50-slc308".
+pypxeboot: requesting info for MAC address AA:00:86:e2:35:72
+pypxeboot: getting cfg for IP 134.226.53.114 (86E23572) from server 192.168.12.1
+pypxeboot: downloading initrd using cmd: tftp -c get 192.168.12.1:slc308_i386_xen/initrd.img
+pypxeboot: downloading kernel using cmd: tftp -c get 192.168.12.1:slc308_i386_xen/vmlinuz
+Started domain cagnode50
+
+N.B. the kernel and initrd on the tftp server must be Xen Linux kernels.
+
+Bugs
+pypxeboot assumes a lot about the pxelinux setup on the server. In particular
+it assumes that configuration files are in the directory pxelinux.cfg and it
+also only copes with single-entry config files. It also leaves downloaded files
+in /tmp
+
+Related stuff
+If you're interested in getting anaconda/kickstart working for Xen DomUs, Linux
+Support at CERN have some suitable installation images and instructions
+available for SLC3/4 (RHEL3/4 compatible).
+
+pypxeboot was written by Stephen Childs (C) 2007 Trinity College Dublin.
+Email help at grid dot ie if you have feedback, problems, bug reports.
+
+[1]: http://udhcp.busybox.net/
+[2]: http://tftpy.sourceforge.net/
+[3]: https://grid.ie/pypxeboot/pypxeboot-0.0.3.tar.gz
+[4]: https://twiki.cern.ch/twiki/bin/view/LinuxSupport/XenHowTo

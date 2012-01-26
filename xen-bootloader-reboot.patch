@@ -1,0 +1,31 @@
+diff -ur a/tools/python/xen/xend/XendDomainInfo.py b/tools/python/xen/xend/XendDomainInfo.py
+--- a/tools/python/xen/xend/XendDomainInfo.py	2006-10-15 13:22:03.000000000 +0100
++++ b/tools/python/xen/xend/XendDomainInfo.py	2007-06-19 10:55:50.000000000 +0100
+@@ -1632,9 +1632,11 @@
+         @param rename True if the old domain is to be renamed and preserved,
+         False if it is to be destroyed.
+         """
+-
+-        self.configure_bootloader()
++        # Delaying bootloader run until domain has been destroyed
++        # and its networking torn down 
++        # self.configure_bootloader()
+         config = self.sxpr()
++        oldimage=self.info['image']
+ 
+         if self.infoIsSet('cpus') and len(self.info['cpus']) != 0:
+             config.append(['cpus', reduce(lambda x, y: str(x) + "," + str(y),
+@@ -1670,6 +1672,13 @@
+             else:
+                 self.unwatchVm()
+                 self.destroyDomain()
++            # configure bootloader here now the previous domain
++            # is destroyed
++            self.configure_bootloader()
++
++            # replace old image config with one from bootloader
++            config.remove(['image',oldimage])
++            config.append(['image',self.info['image']])
+ 
+             # new_dom's VM will be the same as this domain's VM, except where
+             # the rename flag has instructed us to call preserveForRestart.
